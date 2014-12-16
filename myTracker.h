@@ -12,13 +12,16 @@ typedef struct _trackerlet
 	int Height;
 	blockFeature featureSet;//每个trackerlet都有对应的特征提取，用于之后进行前后差异性对比
 	_trackerlet* next;
-
+	void setBlockFeature(blockFeature& blockfeatures)
+	{
+		featureSet = blockfeatures;
+	}
 }Trackerlet;
 
 class Tracker
 {
-	const static int stateNum = 4;//状态矩阵
-	const static int measureNum = 2;//测量矩阵，
+	int stateNum;//状态矩阵[x,y,dx,dy,width,height,dw,dh]
+	int measureNum;//测量矩阵，[x,y,width,height]
 	cv::Mat state; // (x,y,dX,dY)
 	cv::Mat processNoise;
 	cv::Mat measurement;
@@ -30,5 +33,5 @@ class Tracker
 public:
 	Tracker();
 	void setLoackedPedArea(LockedArea *result);
-	bool update(cv::Mat &souceImage);//对之前tracklet进行更新，及产生新的tracklet，用于管理,如果更新失败，则设定request
+	bool update(cv::Mat &souceImage,bool haveRectBoxing);//对之前tracklet进行更新，及产生新的tracklet，用于管理,如果更新失败，则设定request
 };
