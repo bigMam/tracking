@@ -4,7 +4,6 @@
 
 #define HAVE_BORDER 1
 //使用边界预测，但是对其不进行赋值，对角坐标预测效果反而不错，暂时不追究其原因，先将整个代码跑通，框架搭好先
-
 Tracker::Tracker()
 {
 	//完成对kalman滤波器的初始化操作，用于之后的tracklet的预测过程
@@ -46,8 +45,32 @@ Tracker::Tracker()
 	//对二次特征提取模块进行初始化操作
 	extractor = FeatureExtractor();
 	extractor.initCache();
-	lockedPedArea = NULL;
-	trackerletHead = NULL;
+	lockedPedArea = NULL;//不含头节点
+	targetTrackerlet = NULL;//当前指向空
+	//权重初始化操作
+	for(int i = 0; i < 8; ++i)
+	{
+		weights[i] = 1.0 / 8;
+	}
+	front = 0;//初始化列表内容为空
+	rear = 0;
+	for(int i = 0; i < capacity; i++)
+	{
+		distratorList[i] = NULL;
+	}
+}
+
+//对残留内容进行删除操作，主要是distrator列表内容
+Tracker::~Tracker()
+{
+	int traversal = rear;
+	//清空列表
+	while(traversal != front)
+	{
+		delete distratorList[traversal];
+		traversal = (traversal + 1) % capacity;
+	}
+	delete targetTrackerlet;
 }
 
 
@@ -56,61 +79,162 @@ void Tracker::setLoackedPedArea(LockedArea* result)
 	lockedPedArea = result;//直接指向同一内存空间就好了，暂时先这样处理，后续可能会要进行改变
 }
 
-//更新过程的思路整理，
-//一是直接根据行人检测矩形框进行tracklet提取
-//二是根据kalman预测结果进行tracklet提取，并与之前tracklet进行比较
-//如果差别在可接受范围内，则进行更新，否则认为更新失败，需要想detector发送检测请求
-//返回值为isRequset,表示当前更新后是否需要进行检测，更新失败则需要进行检测，
-//应该而且很有必要将边框信息考虑进来？直接使用之前的边框信息不可以？
-//关于左上角点的预测还是有一定效果的
+bool Tracker::update(cv::Mat &sourceImage)
+{
+	if(targetTrackerlet == 0)//当前targetTrackerlet为空
+	{
+		if(lockedPedArea->next != NULL)//这里需要假定在视频的初始阶段有且仅有目标行人出现并可检测，这一限定条件
+		{
+			Trackerlet* trackerlet = new Trackerlet();
+			extractTracklet(sourceImage,lockedPedArea->next,trackerlet);
+			targetTrackerlet = trackerlet;//这里因为之前没有存在traget，这里可以直接赋值，没有问题
+
+			//在原图上进行绘制，红色表示测量值
+			circle(sourceImage,cv::Point(trackerlet->topLeftX,trackerlet->topLeftY),5,CV_RGB(255,0,0),3);
+
+			//根据当前检测值对kalman进行修正，这里的predict必须添加，但这里的预测结果是没有不关心的，因为存在检测值
+			Mat prediction = KF.predict();
+			measurement.at<float>(0) = (float)trackerlet->topLeftX;
+			measurement.at<float>(1) = (float)trackerlet->topLeftY;
+			KF.correct(measurement);//利用当前测量值对其滤波器进行修正
+			//这里直接认定检测得到就是正确的显然是存在问题的，
+
+			//遍历删除操作
+			LockedArea *head = lockedPedArea;
+			LockedArea *current = lockedPedArea->next;
+			while(current != NULL)
+			{
+				LockedArea* tmp = current;
+				head->next = current->next;
+				delete tmp;
+				current = head->next;
+			}
+			return false;
+		}
+		else
+		{
+			return true;//表示当前不存在检测矩形框，需要进一步的检测过程，
+		}
+	}
+	else//当前targetTrackerlet存在值，可以进行比较、预测过程
+	{
+		Trackerlet* newTargetTrackerlet = NULL;//用于存储新得到tracklet，无论是检测得到还是预测得到
+
+		//首先对lockedPedArea进行遍历判断，两个结果：一个是发现targetTrackerlet，另外就是没有发现，好像废话，，，
+		LockedArea* current = lockedPedArea->next;//遍历判断，这里链表并没有头节点
+		while(current != NULL)
+		{
+			Trackerlet* trackerlet = new Trackerlet();
+			extractTracklet(sourceImage,current,trackerlet);
+			double distinguishValue = this->distinguish(targetTrackerlet->featureSet,trackerlet->featureSet);
+			std::cout<<"差异值为："<<distinguishValue<<std::endl;
+			if(distinguishValue < 0.65)//认定为目标行人，阈值后续观察后再进行调节
+			{
+				newTargetTrackerlet = trackerlet;
+				circle(sourceImage,cv::Point(trackerlet->topLeftX,trackerlet->topLeftY),5,CV_RGB(255,0,0),3);
+				current = current->next;
+
+				measurement.at<float>(0) = (float)newTargetTrackerlet->topLeftX;
+				measurement.at<float>(1) = (float)newTargetTrackerlet->topLeftY;
+				KF.correct(measurement);
+				break;
+			}
+			else//加入distrator列表
+			{
+				insertDistrator(trackerlet);
+				current = current->next;
+			}
+		}
+		//将剩余tracklet放入distrator
+		while(current != NULL)
+		{
+			Trackerlet* trackerlet = new Trackerlet();
+			extractTracklet(sourceImage,current,trackerlet);
+			insertDistrator(trackerlet);
+			current = current->next;
+		}
+		//使用结束之后，清空lockedPedArea操作,遍历删除
+		LockedArea *head = lockedPedArea;
+		current = lockedPedArea->next;
+		while(current != NULL)
+		{
+			LockedArea* tmp = current;
+			head->next = current->next;
+			delete tmp;
+			current = head->next;
+		}
+
+		if(newTargetTrackerlet == NULL)//之前经由lockedPedArea，并没有得到可用的trackerlet，需要经由kalman进行滤波预测
+		{
+			Mat prediction = KF.predict();//利用滤波器对当前检测tracklet矩形进行预测
+			float *data = prediction.ptr<float>(0);
+			int predictX = data[0];
+			int predictY = data[1];
+			cv::Mat subImage = sourceImage(cv::Rect(predictX,predictY,targetTrackerlet->width,targetTrackerlet->height));
+			blockFeature target;
+			extractor.computeFeature(subImage,target);
+			//将当前得到blockfeature与之前存储内容进行比较
+			double distinguishValue = this->distinguish(targetTrackerlet->featureSet,target);
+			std::cout<<"差异值为："<<distinguishValue<<std::endl;
+			if(distinguishValue > 0.65)//当前预测结果并不能满足相似度要求，发出检测请求
+				return true;
+			else
+			{
+				//将预测结果保存下来
+				Trackerlet* trackerlet = new Trackerlet();
+				trackerlet->trackerletID = 0;//这个ID暂时没有什么意义，先临时放在这里
+				trackerlet->topLeftX = predictX;
+				trackerlet->topLeftY = predictY;
+				trackerlet->width = targetTrackerlet->width;
+				trackerlet->height = targetTrackerlet->height;
+				trackerlet->setBlockFeature(target);
+				trackerlet->next = NULL;
+
+				newTargetTrackerlet = trackerlet;
+				//在原图上进行绘制，绿色表示预测值
+				circle(sourceImage,cv::Point(predictX,predictY),5,CV_RGB(0,255,0),3);
+				cv::rectangle(sourceImage,
+					cv::Rect(predictX,predictY,targetTrackerlet->width,targetTrackerlet->height),
+					cv::Scalar(255,0,0),2);
+			}
+		}
+		//终于到这里了，根据三方内容进行权重调节
+		featureWeighting(newTargetTrackerlet->featureSet);
+
+		//还有扫尾工作需要完成，，，
+		//利用当前newTraget测量值对其滤波器进行修正
+		//measurement.at<float>(0) = (float)newTargetTrackerlet->topLeftX;
+		//measurement.at<float>(1) = (float)newTargetTrackerlet->topLeftY;
+		//KF.correct(measurement);
+		//更新targetTrackerlet
+
+		//insertDistrator(targetTrackerlet);
+		//targetTrackerlet = newTargetTrackerlet;//这里需要仔细看一下，这样做可以么？会不会指向同一位置的内容被改变呢，不会的
+		
+		return false;//表示不需要进行检测，可以继续进行下一次循环
+		//tracker思路终于清晰了，嘎嘎
+	}
+}
 bool Tracker::update(cv::Mat &sourceImage,bool haveRectBoxing)
 {
 	//表示当前有新鲜出炉的行人检测矩形框，不需要进行预测过程？有待商榷
 	if(haveRectBoxing && lockedPedArea != NULL)
 	{
-		//根据lockedPedArea产生新的tracklet
-		int topLeftX = lockedPedArea->topLeftX;
-		int topLeftY = lockedPedArea->topLeftY;
-		int width = lockedPedArea->width;
-		int height = lockedPedArea->height;
-
-		int letWidth = width * 0.4;
-		int letHeight = height * 0.18;
-		int letTopLeftX = topLeftX + width * 0.3;
-		int letTopLeftY = topLeftY + height * 0.25;
-		cv::Mat subImage = sourceImage(cv::Rect(letTopLeftX,letTopLeftY,letWidth,letHeight));
-		cv::rectangle(sourceImage,cv::Rect(letTopLeftX,letTopLeftY,letWidth,letHeight),cv::Scalar(255,0,0),2);
-
-		blockFeature target;
-		extractor.computeFeature(subImage,target);
 
 		Trackerlet* trackerlet = new Trackerlet();
-		trackerlet->topLeftX = letTopLeftX;
-		trackerlet->topLeftY = letTopLeftY;
-		trackerlet->width = letWidth;
-		trackerlet->Height = letHeight;
-		trackerlet->next = NULL;
-		trackerlet->setBlockFeature(target);
-		trackerlet->trackerletID = 0;//这个ID暂时没有什么意义，先临时放在这里
-		circle(sourceImage,cv::Point(letTopLeftX,letTopLeftY),5,CV_RGB(255,0,0),3);//将当前测量值直接在原图上进行绘制
+		extractTracklet(sourceImage,lockedPedArea,trackerlet);
+		circle(sourceImage,cv::Point(trackerlet->topLeftX,trackerlet->topLeftY),5,CV_RGB(255,0,0),3);
 
 		//根据当前检测值对kalman进行修正，这里的predict必须添加，但这里的预测结果是没有不关心的，因为存在检测值
 		Mat prediction = KF.predict();
 
-		measurement.at<float>(0) = (float)letTopLeftX;
-		measurement.at<float>(1) = (float)letTopLeftY;
-#if HAVE_BORDER == 1
-		//measurement.at<float>(2) = (float)letWidth;
-		//measurement.at<float>(3) = (float)letHeight;//存在疑问，这里为什么不能加上这里的测量值，理论上对x、y值是没有影响的
-		//需要通过阅读源码对其进行解释？？？？存疑，但是还是需要继续走下去
-#endif
+		measurement.at<float>(0) = (float)trackerlet->topLeftX;
+		measurement.at<float>(1) = (float)trackerlet->topLeftY;
+
 		KF.correct(measurement);//利用当前测量值对其滤波器进行修正
 
-		if(trackerletHead != NULL)
-		{
-			delete trackerletHead;
-		}
-		trackerletHead = trackerlet;
+		targetTrackerlet = trackerlet;//这里直接替换也是不正确的，替换需要在权重计算结束之后才进行
+		//这里直接认定检测得到就是正确的显然是存在问题的，
 		return false;
 
 	}
@@ -122,41 +246,238 @@ bool Tracker::update(cv::Mat &sourceImage,bool haveRectBoxing)
 		float *data = prediction.ptr<float>(0);
 		int predictX = data[0];
 		int predictY = data[1];
-#if HAVE_BORDER == 1
-		int predictW = data[2];//这里的边框值暂时不需要，而是选择使用tracklet的边框进行取值
-		int predictH = data[3];
-#endif
 		std::cout<<predictX<<" "<<predictY<<" "<<std::endl;
-		if(trackerletHead == NULL)
-			//当前并没有tracklet存在，直接返回true
+
+		if (targetTrackerlet == NULL)
 			return true;
 		else
 		{
 			//这里将根据当前得到tracklet与之前tracklet进行预测匹配，如果相似度可以则保留，否则删除，并发出检测请求
 			//代码虽多但要思路清晰
-			int letWidth = trackerletHead->width;
-			int letHeight = trackerletHead->Height;
+			int letWidth = targetTrackerlet->width;
+			int letHeight = targetTrackerlet->height;
 			cv::Mat subImage = sourceImage(cv::Rect(predictX,predictY,letWidth,letHeight));
 			blockFeature target;
 			extractor.computeFeature(subImage,target);
+
 			//将当前得到blockfeature与之前存储内容进行比较
-			double distinguish = extractor.distinguish(trackerletHead->featureSet,target);
+			double distinguish = this->distinguish(targetTrackerlet->featureSet,target);
 			std::cout<<"差异值为："<<distinguish<<std::endl;
-			if(distinguish > 0.3)
+			if(distinguish > 0.35)
 				return true;
 			else
 			{
-				//对tracklet进行更新过程，含权重调整，这里的
-				//trackerletHead->setBlockFeature(target);
-				//trackerletHead->topLeftX = predictX;
-				//trackerletHead->topLeftY = predictY;
-				//measurement.at<float>(0) = (float)predictX;
-				//measurement.at<float>(1) = (float)predictY;
-				//KF.correct(measurement);这里直接用预测值来进行修正显然是不合理的
 				circle(sourceImage,cv::Point(predictX,predictY),5,CV_RGB(0,255,0),3);
 				cv::rectangle(sourceImage,cv::Rect(predictX,predictY,letWidth,letHeight),cv::Scalar(255,0,0),2);
 				return false;
 			}
 		}
 	}
+}
+
+//这里存在一个反复出现的内容，可以提取作为一个单独函数实现
+//根据矩形框，提取tacklet
+void Tracker::extractTracklet(cv::Mat &sourceImage,LockedArea* lockedPedArea,Trackerlet* trackerlet)
+{
+	int topLeftX = lockedPedArea->topLeftX;
+    int topLeftY = lockedPedArea->topLeftY;
+	int width = lockedPedArea->width;
+	int height = lockedPedArea->height;
+	cv::Rect rect(topLeftX,topLeftY,width,height);
+
+	int letWidth = rect.width * 0.4;
+	int letHeight = rect.height * 0.18;
+	int letTopLeftX = rect.x + rect.width * 0.3;
+	int letTopLeftY = rect.y + rect.height * 0.25;
+	cv::Mat subImage = sourceImage(cv::Rect(letTopLeftX,letTopLeftY,letWidth,letHeight));
+
+	blockFeature target;
+	extractor.computeFeature(subImage,target);
+
+	trackerlet->trackerletID = 0;//这个ID暂时没有什么意义，先临时放在这里
+	trackerlet->topLeftX = letTopLeftX;
+	trackerlet->topLeftY = letTopLeftY;
+	trackerlet->width = letWidth;
+	trackerlet->height = letHeight;
+	trackerlet->setBlockFeature(target);
+	trackerlet->next = NULL;
+
+	//对矩形框进行标定
+	cv::rectangle(sourceImage,cv::Rect(letTopLeftX,letTopLeftY,letWidth,letHeight),cv::Scalar(255,0,0),2);
+}
+
+//将tracket插入到distrator列表中，并保证容量不超过上限，在超出时，能够删除last one
+void Tracker::insertDistrator(Trackerlet* tracklet)
+{
+	//可以使用队列的形式，FIFO，符合队列操作一般特性，
+	//操作到后面，往往是利用新添加元素将指定元素进行替换，在队列已满的情形下，也是能够快速插入的
+
+	//注：front 指向队头后一个元素，rear指向队尾元素
+	if((front + 1)%capacity == rear)//队满
+	{
+		//插入之后需要将队尾元素出队
+		distratorList[front] = tracklet;
+		front = (front + 1)%capacity;
+		//队尾元素出队
+		Trackerlet* tmp = distratorList[rear];
+		//将元素删除
+		delete tmp;
+		rear = (rear + 1)%capacity;
+	}
+	else//队未满可以直接进行插入操作
+	{
+		distratorList[front] = tracklet;
+		front = (front + 1)%capacity;
+	}
+
+}
+
+//计算当前特征与目标特征之间的差值
+double Tracker::distinguish(blockFeature& target, blockFeature& current)
+{
+	cv::MatND targetLBP = cv::Mat(target.cs_lbpFeature);
+	cv::MatND currentLBP = cv::Mat(current.cs_lbpFeature);
+	cv::MatND targetCanny = cv::Mat(target.cannyFeature);
+	cv::MatND currentCanny = cv::Mat(current.cannyFeature);
+
+	double hueDistance = compareHist(target.hueHist,current.hueHist,CV_COMP_BHATTACHARYYA);
+	double satDistance = compareHist(target.satHist,current.satHist,CV_COMP_BHATTACHARYYA);
+	double valDistance = compareHist(target.valHist,current.valHist,CV_COMP_BHATTACHARYYA);
+	double lbpDistance = compareHist(targetLBP,currentLBP,CV_COMP_BHATTACHARYYA);
+	double cannyDistance = compareHist(targetCanny,currentCanny,CV_COMP_BHATTACHARYYA);
+	double horDerDistance = compareHist(target.horDerHist,current.horDerHist,CV_COMP_BHATTACHARYYA);
+	double verDerDistance = compareHist(target.verDerHist,current.verDerHist,CV_COMP_BHATTACHARYYA);
+
+	cv::MatND targetEHD = cv::Mat(5,1,CV_32F);
+	cv::MatND currentEHD = cv::Mat(5,1,CV_32F);
+	for(int i = 0; i < 5; i++)
+	{
+		float* targetPtr = targetEHD.ptr<float>(i);
+		float* currentPtr = currentEHD.ptr<float>(i);
+		targetPtr[0] = target.EHD[i];
+		currentPtr[0] = current.EHD[i];
+	}
+	double EHDDistance = compareHist(targetEHD,currentEHD,CV_COMP_BHATTACHARYYA);
+	//完成距离计算过程，
+
+	//计算当前图像块与目标图像块的差异值
+	double dissimilarity = weights[0] * hueDistance + weights[0] * satDistance + weights[0] * valDistance + 
+		weights[0] * lbpDistance + weights[0] * cannyDistance + weights[0] * horDerDistance + 
+		weights[0] * verDerDistance + weights[0] * EHDDistance;
+
+	std::cout<<"dissimilarity is :"<<dissimilarity<<std::endl;
+	return dissimilarity;
+}
+//根据当前current（正确目标），preTarget（先前存储的），distrator，已抛弃内容，
+void Tracker::featureWeighting(blockFeature& current)
+{
+	//根据论文中给出的公式分别计算各个巴氏距离
+	cv::MatND targetEHD = cv::Mat(5,1,CV_32F);
+	cv::MatND currentEHD = cv::Mat(5,1,CV_32F);
+
+	//current距离与所有distrator的feature巴氏距离均值
+	double meanhueDistance = 0,meansatDistance = 0,meanvalDistance = 0;
+	double meanlbpDistance = 0,meancannyDistance = 0;
+	double meanhorDerDistance = 0,meanverDerDistance = 0,meanEHDDistance = 0;
+
+	cv::MatND currentLBP = cv::Mat(current.cs_lbpFeature);
+	cv::MatND currentCanny = cv::Mat(current.cannyFeature);
+
+	int traversal = rear;
+	while(traversal != front)
+	{   Trackerlet *distratorPtr = distratorList[traversal];
+		cv::MatND targetLBP = cv::Mat(distratorPtr->featureSet.cs_lbpFeature);
+		cv::MatND targetCanny = cv::Mat(distratorPtr->featureSet.cannyFeature);
+
+		meanhueDistance = meanhueDistance + compareHist(distratorPtr->featureSet.hueHist,current.hueHist,CV_COMP_BHATTACHARYYA);
+		meansatDistance = meansatDistance + compareHist(distratorPtr->featureSet.satHist,current.satHist,CV_COMP_BHATTACHARYYA);
+		meanvalDistance = meanvalDistance + compareHist(distratorPtr->featureSet.valHist,current.valHist,CV_COMP_BHATTACHARYYA);
+		meanlbpDistance = meanlbpDistance + compareHist(targetLBP,currentLBP,CV_COMP_BHATTACHARYYA);
+		meancannyDistance = meancannyDistance + compareHist(targetCanny,currentCanny,CV_COMP_BHATTACHARYYA);
+		meanhorDerDistance = meanhorDerDistance + compareHist(distratorPtr->featureSet.horDerHist,current.horDerHist,CV_COMP_BHATTACHARYYA);
+		meanverDerDistance = meanverDerDistance + compareHist(distratorPtr->featureSet.verDerHist,current.verDerHist,CV_COMP_BHATTACHARYYA);
+		for(int i = 0; i < 5; i++)
+		{
+			float* targetPtr = targetEHD.ptr<float>(i);
+			float* currentPtr = currentEHD.ptr<float>(i);
+			targetPtr[0] = distratorPtr->featureSet.EHD[i];
+			currentPtr[0] = current.EHD[i];
+		}
+		meanEHDDistance = meanEHDDistance + compareHist(targetEHD,currentEHD,CV_COMP_BHATTACHARYYA);
+		traversal = (traversal + 1) % capacity;
+	}
+	if(rear != front)//表示当前distrator列表非空
+	{
+		int count = rear < front ? front - rear : front - rear + capacity;
+		meanhueDistance = meanhueDistance / count;
+		meansatDistance = meansatDistance / count;
+		meanvalDistance = meanvalDistance / count;
+		meanlbpDistance = meanlbpDistance / count;
+		meancannyDistance = meancannyDistance / count;
+		meanhorDerDistance = meanhorDerDistance / count;
+		meanverDerDistance = meanverDerDistance / count;
+		meanEHDDistance = meanEHDDistance / count;
+	}
+	
+	//current与preTarget的feature巴氏距离的计算
+	double hueDistance = 0,satDistance = 0,valDistance = 0;
+	double lbpDistance = 0,cannyDistance = 0;
+	double horDerDistance = 0,verDerDistance = 0,EHDDistance = 0;
+
+	cv::MatND targetLBP = cv::Mat(targetTrackerlet->featureSet.cs_lbpFeature);
+	cv::MatND targetCanny = cv::Mat(targetTrackerlet->featureSet.cannyFeature);
+
+	hueDistance = compareHist(targetTrackerlet->featureSet.hueHist,current.hueHist,CV_COMP_BHATTACHARYYA);
+	satDistance = compareHist(targetTrackerlet->featureSet.satHist,current.satHist,CV_COMP_BHATTACHARYYA);
+	valDistance = compareHist(targetTrackerlet->featureSet.valHist,current.valHist,CV_COMP_BHATTACHARYYA);
+	lbpDistance = compareHist(targetLBP,currentLBP,CV_COMP_BHATTACHARYYA);
+	cannyDistance = compareHist(targetCanny,currentCanny,CV_COMP_BHATTACHARYYA);
+	horDerDistance = compareHist(targetTrackerlet->featureSet.horDerHist,current.horDerHist,CV_COMP_BHATTACHARYYA);
+	verDerDistance = compareHist(targetTrackerlet->featureSet.verDerHist,current.verDerHist,CV_COMP_BHATTACHARYYA);
+
+	for(int i = 0; i < 5; i++)
+	{
+		float* targetPtr = targetEHD.ptr<float>(i);
+		float* currentPtr = currentEHD.ptr<float>(i);
+		targetPtr[0] = targetTrackerlet->featureSet.EHD[i];
+		currentPtr[0] = current.EHD[i];
+	}
+	EHDDistance = compareHist(targetEHD,currentEHD,CV_COMP_BHATTACHARYYA);
+	
+	//完成对feature的权重调整过程，这里仅仅是一种方法，但这是否是最好的方法呢，还有待进一步的确定
+	//最终的目标是weight为正值，同时保证其和为一
+	//分解：一是计算各个feature得分，根据当前三方彼此相似度，区分度计算原则
+	//与target尽可能接近（distance小），同时distrator差异度尽可能大（meandistance大）。
+	//区分度大的feature具有更到的得分
+	//首先分数一定是正值么？这里可以将（meanDistance - distance）进行比例换算，对应到不同的score
+	//二是根据各个feature得分，对weight进行调整，
+	//三是对调整后weight进行归一化，保证其最终和为一
+
+	//将 df1 - df2 更改为 df1 / df2,太机智了，同样满足了反比条件，但在实际计算中是否
+	//将 weight = weight + score 更改为 weight = weight * score，
+	//解释，score表示当前差异度与相似度的比例关系，> 1 差异度占上风， < 1 相似度占上风
+	//*score,如果差异度占上风则扩大weight，否则缩小weight
+	//总结，只是自作聪明，最终的结果导致某一特征权重无限大，其他趋向于零，是的权重计算失去意义
+	//还是需要重新考虑score 为正的情形
+	if(meanhueDistance != 0 && hueDistance != 0)
+	{
+		weights[0] = weights[0] + (meanhueDistance - hueDistance);
+		weights[1] = weights[1] + (meansatDistance - satDistance);
+		weights[2] = weights[2] + (meanvalDistance - valDistance);
+		weights[3] = weights[3] + (meanlbpDistance - lbpDistance);
+		weights[4] = weights[4] + (meancannyDistance - cannyDistance);
+		weights[5] = weights[5] + (meanhorDerDistance - horDerDistance);
+		weights[6] = weights[6] + (meanverDerDistance - verDerDistance);
+		weights[7] = weights[7] + (meanEHDDistance - EHDDistance);
+	}
+	double sum = 0;
+	for(int i = 0; i < 8; ++i)
+	{
+		sum = sum + weights[i];
+	}
+	for(int i = 0; i < 8; ++i)
+	{
+		weights[i] = weights[i] / sum;
+	}
+	//完成权重调整，但是还不知道效果如何
 }
